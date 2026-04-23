@@ -211,28 +211,36 @@ class CZSC:
         # cache 是信号计算过程的缓存容器，需要信号计算函数自行维护
         self.cache = OrderedDict()
 
-        # ===== 调试打印：CZSC 初始化 =====
-        print(f"\n{'='*60}")
-        print(f"[DEBUG] CZSC 初始化:")
-        print(f"  - symbol: {self.symbol}")
-        print(f"  - freq: {self.freq} (value={self.freq.value})")
-        print(f"  - K线数量: {len(bars)}")
-        print(f"  - 第一根K线: {bars[0].dt}")
-        print(f"  - 最后一根K线: {bars[-1].dt}")
-        print(f"{'='*60}\n")
-        # breakpoint()  # 取消注释以暂停调试
+        if self.verbose:
+            logger.debug(
+                "CZSC 初始化: symbol={}, freq={} (value={}), K线数量={}, 第一根K线={}, 最后一根K线={}",
+                self.symbol,
+                self.freq,
+                self.freq.value,
+                len(bars),
+                bars[0].dt,
+                bars[-1].dt,
+            )
 
         for bar in bars:
             self.update(bar)
         
-        # ===== 调试打印：CZSC 初始化完成 =====
-        print(f"\n{'='*60}")
-        print(f"[DEBUG] CZSC 初始化完成:")
-        print(f"  - 笔数量: {len(self.bi_list)}")
+        if not self.verbose:
+            return
+
         if self.bi_list:
-            print(f"  - 第一笔: {self.bi_list[0].sdt} -> {self.bi_list[0].edt} ({self.bi_list[0].direction})")
-            print(f"  - 最后一笔: {self.bi_list[-1].sdt} -> {self.bi_list[-1].edt} ({self.bi_list[-1].direction})")
-        print(f"{'='*60}\n")
+            logger.debug(
+                "CZSC 初始化完成: 笔数量={}, 第一笔={} -> {} ({}), 最后一笔={} -> {} ({})",
+                len(self.bi_list),
+                self.bi_list[0].sdt,
+                self.bi_list[0].edt,
+                self.bi_list[0].direction,
+                self.bi_list[-1].sdt,
+                self.bi_list[-1].edt,
+                self.bi_list[-1].direction,
+            )
+        else:
+            logger.debug("CZSC 初始化完成: 笔数量=0")
 
     def __repr__(self):
         return "<CZSC~{}~{}>".format(self.symbol, self.freq.value)

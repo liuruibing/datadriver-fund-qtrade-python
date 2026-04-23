@@ -1,0 +1,7 @@
+#!/Volumes/onePiece/公司前端项目/量化交易平台/datadriver-fund-qtrade-python/backend/test_venv/bin/python3.11
+import sys
+from pip._internal.cli.main import main
+if __name__ == '__main__':
+    if sys.argv[0].endswith('.exe'):
+        sys.argv[0] = sys.argv[0][:-4]
+    sys.exit(main())

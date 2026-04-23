@@ -21,6 +21,10 @@ os.environ["CZSC_USE_PYTHON"] = "1"
 
 import czsc
 from czsc import Freq
+from core.chanlun.algorithms import calculate_main_bs_points, get_zs_seq
+from core.chanlun.data import aggregate_kline_by_rule, clean_kline_df
+from core.chanlun.history_response import build_history_payload, build_simple_kline_response
+from core.chanlun.utils import resolution_to_freq
 
 # TradingView UDF 端点实现
 class TradingViewViewSet(viewsets.GenericViewSet):
@@ -120,7 +124,6 @@ class TradingViewViewSet(viewsets.GenericViewSet):
         countback = request.query_params.get('countback')
         first_data_request = request.query_params.get('firstDataRequest', '').lower() == 'true'
         logger.info(f"[history] 接收请求: symbol={symbol}, resolution={resolution}, from_time={from_time}, to_time={to_time}")
-        print(f"[history] 接收请求: symbol={symbol}, resolution={resolution}, from_time={from_time}, to_time={to_time}")
 
         # 如果没有symbol，尝试从当前请求上下文获取（TradingView第一次请求时可能没有symbol）
         # 暂时使用上证指数作为默认值
@@ -132,9 +135,7 @@ class TradingViewViewSet(viewsets.GenericViewSet):
             result = self._get_kline_with_chanlun(symbol, resolution, from_time, to_time, countback, first_data_request)
             return Response(result)
         except Exception as e:
-            print(f"Error in history: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("Error in history: %s", e)
             # 如果出错，尝试返回mock数据
             base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
             mock_file_path = os.path.join(base_dir, 'history_601888_日线_all_zsshape.json')
@@ -146,20 +147,16 @@ class TradingViewViewSet(viewsets.GenericViewSet):
 
     def _get_kline_with_chanlun(self, symbol, resolution, from_time=None, to_time=None, countback=None, first_data_request=False):
         """从数据库获取K线数据并进行缠论分析，转换为TradingView格式"""
-        print(f"[_get_kline_with_chanlun] 开始处理: symbol={symbol}, resolution={resolution}, from_time={from_time}, to_time={to_time}, countback={countback}")
-        # 将 resolution 映射到 czsc.Freq
-        resolution_map = {
-            '5': Freq.F5,
-            '30': Freq.F30,
-            '1D': Freq.D,
-            '1W': Freq.W,
-            '1M': Freq.M,
-            '3M': Freq.S,  # 季线
-            '12M': Freq.Y, # 年线（使用 12M 而不是 1Y）
-            '1Y': Freq.Y   # 年线（兼容旧的 1Y 格式）
-        }
-        freq_enum = resolution_map.get(resolution, Freq.D)
-        print(f"[_get_kline_with_chanlun] freq_enum={freq_enum}")
+        logger.debug(
+            "[_get_kline_with_chanlun] 开始处理: symbol=%s, resolution=%s, from_time=%s, to_time=%s, countback=%s",
+            symbol,
+            resolution,
+            from_time,
+            to_time,
+            countback,
+        )
+        freq_enum = resolution_to_freq(resolution) or Freq.D
+        logger.debug("[_get_kline_with_chanlun] freq_enum=%s", freq_enum)
 
         # 确定是否为日线级别
         is_daily = freq_enum in (Freq.D, Freq.W, Freq.M, Freq.S, Freq.Y)
@@ -197,8 +194,16 @@ class TradingViewViewSet(viewsets.GenericViewSet):
                 pass  # 使用默认的 start_date
 
         # 从数据库查询日线数据
-        print(f"查询数据: symbol={symbol}, resolution={resolution}, freq_enum={freq_enum}, start={start_date.strftime('%Y%m%d')}, end={end_date.strftime('%Y%m%d')}")
-        print(f"原始参数: from_time={from_time}, to_time={to_time}")
+        logger.debug(
+            "查询数据: symbol=%s, resolution=%s, freq_enum=%s, start=%s, end=%s, from_time=%s, to_time=%s",
+            symbol,
+            resolution,
+            freq_enum,
+            start_date.strftime('%Y%m%d'),
+            end_date.strftime('%Y%m%d'),
+            from_time,
+            to_time,
+        )
         daily_data = DailyMarket.objects.filter(
             ts_code=symbol,
             trade_date__lte=end_date.strftime('%Y%m%d'),
@@ -211,30 +216,14 @@ class TradingViewViewSet(viewsets.GenericViewSet):
         df = pd.DataFrame(list(daily_data))
 
         if df.empty:
-            print(f"查询数据为空: symbol={symbol}, freq={resolution}")
+            logger.debug("查询数据为空: symbol=%s, freq=%s", symbol, resolution)
             return {"s": "no_data"}
 
-        print(f"查询到 {len(df)} 条日线数据")
+        logger.debug("查询到 %s 条日线数据", len(df))
 
         # 数据预处理
         df['dt'] = pd.to_datetime(df['trade_date'], format='%Y%m%d')
-        df['symbol'] = symbol
-        df = df[["dt", "symbol", "open", "high", "low", "close", "vol", "amount"]].copy().reset_index(drop=True)
-
-        # 确保数值类型安全
-        price_cols = ["open", "high", "low", "close"]
-        for col in price_cols + ["vol", "amount"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        # 填充成交量空值
-        if "vol" in df.columns:
-            df["vol"] = df["vol"].fillna(0)
-        if "amount" in df.columns:
-            df["amount"] = df["amount"].fillna(0)
-
-        # 剔除无效行
-        df = df.dropna(subset=["dt"] + price_cols).reset_index(drop=True)
+        df = clean_kline_df(df, symbol)
 
         if df.empty:
             return {"s": "no_data"}
@@ -252,224 +241,46 @@ class TradingViewViewSet(viewsets.GenericViewSet):
                 Freq.Y: 'Y'       # 年线
             }
             rule = rule_map.get(freq_enum, 'D')
-
-            df.set_index('dt', inplace=True)
-            agg_dict = {
-                'open': 'first',
-                'high': 'max',
-                'low': 'min',
-                'close': 'last',
-                'vol': 'sum',
-                'amount': 'sum',
-                'symbol': 'first'
-            }
-            df = df.resample(rule).agg(agg_dict).dropna()
-            df.reset_index(inplace=True)
+            df = aggregate_kline_by_rule(df, rule)
 
         # CZSC 格式化并分析
         try:
             raw_bars = czsc.format_standard_kline(df, freq=freq_enum)
             c = czsc.CZSC(raw_bars, max_bi_num=1000)
         except Exception as e:
-            print(f"CZSC分析失败: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("CZSC分析失败: %s", e)
             # 如果CZSC分析失败，至少返回K线数据
-            return self._build_simple_kline_response(df, is_daily)
+            return build_simple_kline_response(df, is_daily, freq_enum)
 
-        # 导入中枢和买卖点计算函数
+        # 中枢和买卖点统一走 core.chanlun 的普通算法入口。
         try:
-            # 从 backend 目录导入
-            import importlib.util
-            spec = importlib.util.spec_from_file_location(
-                "ZS_sig",
-                os.path.join(backend_dir, "ZS_sig.py")
-            )
-            ZS_sig = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(ZS_sig)
-
-            get_zs_seq = ZS_sig.get_zs_seq
-            find_B1 = ZS_sig.find_B1
-            find_B2 = ZS_sig.find_B2
-            find_B3 = ZS_sig.find_B3
-            find_S1 = ZS_sig.find_S1
-            find_S2 = ZS_sig.find_S2
-            find_S3 = ZS_sig.find_S3
-        except ImportError as e:
-            print(f"无法导入 ZS_sig: {e}，将不返回中枢和买卖点")
+            zs_list = get_zs_seq(c.bi_list)
+            bs_result = calculate_main_bs_points(c, zs_list)
+            b1_list = bs_result["B1"]
+            b2_list = bs_result["B2"]
+            b3_list = bs_result["B3"]
+            s1_list = bs_result["S1"]
+            s2_list = bs_result["S2"]
+            s3_list = bs_result["S3"]
+        except Exception as e:
+            logger.exception("缠论中枢和买卖点计算失败: %s", e)
             zs_list = []
             b1_list = b2_list = b3_list = s1_list = s2_list = s3_list = []
-        else:
-            # 计算中枢
-            zs_list = get_zs_seq(c.bi_list)
-            # 计算买卖点
-            b1_list = find_B1(c.bi_list, zs_list, c)
-            b2_list = find_B2(c.bi_list, b1_list)
-            b3_list = find_B3(c.bi_list, zs_list)
-            s1_list = find_S1(c.bi_list, zs_list, c)
-            s2_list = find_S2(c.bi_list, s1_list)
-            s3_list = find_S3(c.bi_list, zs_list)
 
         bs_points = b1_list + b2_list + b3_list + s1_list + s2_list + s3_list
 
-        # 处理K线数据
-        bars = list(c.bars_raw)
-
-        # 应用 from/to/countback 过滤
-        if not first_data_request:
-            if from_time is not None or to_time is not None:
-                f = -10**18 if from_time is None else int(from_time)
-                t = 10**18 if to_time is None else int(to_time)
-
-                bars = [b for b in bars if self._dt_to_ts(b.dt, is_daily, freq_enum) is not None
-                        and f <= self._dt_to_ts(b.dt, is_daily, freq_enum) <= t]
-
-            if countback is not None and int(countback) > 0 and len(bars) > int(countback):
-                bars = bars[-int(countback):]
-
-        if not bars:
-            return {"s": "no_data"}
-
-        # 构建K线数组
-        t_arr, o_arr, h_arr, l_arr, c_arr, v_arr = [], [], [], [], [], []
-        for b in bars:
-            ts = self._dt_to_ts(b.dt, is_daily, freq_enum)
-            if ts is None:
-                continue
-            t_arr.append(int(ts))
-            o_arr.append(float(b.open))
-            h_arr.append(float(b.high))
-            l_arr.append(float(b.low))
-            c_arr.append(float(b.close))
-            v_arr.append(float(getattr(b, "vol", 0)))
-
-        if not t_arr:
-            return {"s": "no_data"}
-
-        t_min, t_max = t_arr[0], t_arr[-1]
-
-        # 构建笔数据
-        bis = []
-        for bi in c.bi_list:
-            s_ts = self._dt_to_ts(bi.fx_a.dt, is_daily, freq_enum)
-            e_ts = self._dt_to_ts(bi.fx_b.dt, is_daily, freq_enum)
-            if s_ts is None or e_ts is None:
-                continue
-            if e_ts < t_min or s_ts > t_max:
-                continue
-            bis.append({
-                "points": [
-                    {"time": int(s_ts), "price": float(bi.fx_a.fx)},
-                    {"time": int(e_ts), "price": float(bi.fx_b.fx)}
-                ],
-                "linestyle": "0"
-            })
-
-        # 构建中枢数据
-        bi_zss = []
-        for zs in zs_list:
-            s_ts = self._dt_to_ts(zs.sdt, is_daily, freq_enum)
-            e_ts = self._dt_to_ts(zs.edt, is_daily, freq_enum)
-            if s_ts is None or e_ts is None:
-                continue
-            if e_ts < t_min or s_ts > t_max:
-                continue
-            zg = float(zs.zg)
-            zd = float(zs.zd)
-            s_ts_i, e_ts_i = int(s_ts), int(e_ts)
-            if e_ts_i <= s_ts_i:
-                continue
-            bi_zss.append({
-                "points": [{"time": s_ts_i, "price": zg}, {"time": e_ts_i, "price": zd}],
-                "linestyle": "0"
-            })
-
-        # 构建买卖点数据
-        mmds = []
-        for p in bs_points:
-            ts = self._dt_to_ts(p.get("dt"), is_daily, freq_enum)
-            price = p.get("price")
-            if ts is None or price is None:
-                continue
-            text_val = p.get("op_desc") or p.get("bs_type") or "signal"
-            if isinstance(p.get("bs_type"), str) and p.get("bs_type"):
-                text_val = f"笔:{p.get('bs_type')}"
-            mmds.append({
-                "points": {"time": int(ts), "price": float(price)},
-                "text": str(text_val)
-            })
-
-        # 构建响应
-        result = {
-            "s": "ok",
-            "t": t_arr,
-            "o": o_arr,
-            "h": h_arr,
-            "l": l_arr,
-            "c": c_arr,
-            "v": v_arr,
-            "fxs": [],  # 分型暂不返回
-            "bis": bis,
-            "xds": [],  # 线段暂不返回
-            "zsds": [],  # 走势段暂不返回
-            "bi_zss": bi_zss,
-            "xd_zss": [],  # 线段中枢暂不返回
-            "zsd_zss": [],  # 走势段中枢暂不返回
-            "bcs": [],  # 背驰暂不返回
-            "mmds": mmds
-        }
-
-        return result
-
-    def _build_simple_kline_response(self, df, is_daily):
-        """当CZSC分析失败时，构建简单的K线响应"""
-        t_arr, o_arr, h_arr, l_arr, c_arr, v_arr = [], [], [], [], [], []
-        for _, row in df.iterrows():
-            dt = row['dt']
-            if isinstance(dt, str):
-                dt = pd.to_datetime(dt)
-            ts = int(dt.timestamp()) if is_daily else int(dt.timestamp())
-            t_arr.append(ts)
-            o_arr.append(float(row['open']))
-            h_arr.append(float(row['high']))
-            l_arr.append(float(row['low']))
-            c_arr.append(float(row['close']))
-            v_arr.append(float(row['vol']) if row['vol'] else 0)
-
-        return {
-            "s": "ok",
-            "t": t_arr,
-            "o": o_arr,
-            "h": h_arr,
-            "l": l_arr,
-            "c": c_arr,
-            "v": v_arr,
-            "fxs": [], "bis": [], "xds": [], "zsds": [],
-            "bi_zss": [], "xd_zss": [], "zsd_zss": [], "bcs": [], "mmds": []
-        }
-
-    def _dt_to_ts(self, dt, is_daily=False, freq=None):
-        """将datetime转换为时间戳"""
-        if dt is None:
-            return None
-        try:
-            ts = pd.Timestamp(dt)
-            if ts is pd.NaT:
-                return None
-
-            # 周线特殊处理：将日期转换为周一
-            if freq == Freq.W:
-                days_since_monday = ts.dayofweek
-                ts = ts - pd.Timedelta(days=days_since_monday)
-
-            if is_daily:
-                return int(pd.Timestamp(ts.date()).timestamp())
-            else:
-                if ts.tz is None:
-                    ts = ts.tz_localize("Asia/Shanghai")
-                return int(ts.timestamp())
-        except Exception:
-            return None
+        return build_history_payload(
+            bars_raw=c.bars_raw,
+            bi_list=c.bi_list,
+            zs_list=zs_list,
+            bs_points=bs_points,
+            is_daily=is_daily,
+            freq=freq_enum,
+            from_ts=None if first_data_request else from_time,
+            to_ts=None if first_data_request else to_time,
+            countback=None if first_data_request else countback,
+            first_data_request=first_data_request,
+        )
     
     @action(detail=False, methods=['get'], url_path='search')
     def search(self, request):

@@ -1,4 +1,5 @@
 import numpy as np
+import logging
 from deprecated import deprecated
 from collections import Counter, OrderedDict
 from typing import List, Any, Dict, Union, Tuple, Optional
@@ -6,6 +7,9 @@ from czsc.core import Direction
 from czsc.core import BI, RawBar, ZS, Signal, CZSC
 from czsc.signals.tas import update_macd_cache
 from czsc.core import Operate
+
+logger = logging.getLogger(__name__)
+
 
 def calculate_xd_list(bis: List[BI]) -> List[Dict]:
     """基于结构转折的缠论线段划分方案
@@ -126,7 +130,7 @@ def calculate_xd_list(bis: List[BI]) -> List[Dict]:
         prev_range = abs(prev_xd["end_val"] - prev_xd["start_val"])
         xd["beichi"] = "线段背驰" if prev_range > 0 and xd_range < prev_range * 0.7 else ""
 
-    print(f"[DEBUG] 结构化分段完成，共生成 {len(xds)} 个线段")
+    logger.debug("结构化分段完成，共生成 %s 个线段", len(xds))
     return xds
 
 def create_single_signal(**kwargs) -> OrderedDict:
